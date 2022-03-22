@@ -864,12 +864,22 @@ fn resolve_implicit_base(
 
 fn resolve_base_from_onto(repo: &git_stack::git::GitRepo, onto: &AnnotatedOid) -> AnnotatedOid {
     // HACK: Assuming the local branch is the current base for all the commits
-    onto.branch
+    if let Some(local_branch) = onto
+        .branch
         .as_ref()
         .filter(|b| b.remote.is_some())
         .and_then(|b| repo.find_local_branch(&b.name))
-        .map(AnnotatedOid::with_branch)
-        .unwrap_or_else(|| onto.clone())
+    {
+        if let Some(merge_base_id) = repo.merge_base(local_branch.id, onto.id) {
+            // HACK: Assume commits after the merge-base are from the developer treating the onto
+            // branch as a topic branch.
+            AnnotatedOid::new(merge_base_id)
+        } else {
+            AnnotatedOid::with_branch(local_branch)
+        }
+    } else {
+        onto.clone()
+    }
 }
 
 fn resolve_onto_from_base(repo: &git_stack::git::GitRepo, base: &AnnotatedOid) -> AnnotatedOid {
