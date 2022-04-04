@@ -1,136 +1,206 @@
-use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-
 use crate::graph::Graph;
-use crate::graph::Node;
+use crate::graph::Resource;
 
-pub fn protect_branches(
-    graph: &mut Graph,
-    repo: &dyn crate::git::Repo,
-    protected_branches: &crate::git::Branches,
-) {
-    let root_id = graph.root_id();
-
-    let protected_oids: HashSet<_> = protected_branches
+pub fn protect_branches(graph: &mut Graph) {
+    let protected_oids: Vec<_> = graph
+        .branches
         .iter()
-        .flat_map(|(_, branches)| branches.iter().map(|b| b.id))
+        .filter_map(|(oid, branches)| {
+            branches
+                .iter()
+                .find(|b| b.kind() == crate::graph::BranchKind::Protected)
+                .map(|_| oid)
+        })
+        .flat_map(|protected_oid| graph.ancestors_of(protected_oid))
         .collect();
-
-    for protected_oid in protected_oids.into_iter().filter(|protected_oid| {
-        repo.merge_base(root_id, *protected_oid)
-            .map(|merge_base_oid| merge_base_oid == root_id)
-            .unwrap_or(false)
-    }) {
-        for commit_id in
-            crate::git::commit_range(repo, protected_oid..=root_id).expect("IDs already validated")
-        {
-            let commit = repo
-                .find_commit(commit_id)
-                .expect("commit_range returns valid commits");
-            if let Some(node) = graph.get_mut(commit.id) {
-                if node.action.is_protected() {
-                    break;
-                }
-                node.action = crate::graph::Action::Protected;
-            }
-            if commit.id == root_id {
-                break;
-            }
-        }
+    for protected_oid in protected_oids {
+        graph.commit_set(protected_oid, crate::graph::Action::Protected);
     }
 }
 
 pub fn protect_large_branches(graph: &mut Graph, max: usize) -> Vec<String> {
     let mut large_branches = Vec::new();
 
-    let mut protected_queue = VecDeque::new();
-    if graph.root().action.is_protected() {
-        protected_queue.push_back(graph.root_id());
-    }
-    while let Some(current_id) = protected_queue.pop_front() {
-        let current_children = graph
-            .get(current_id)
-            .expect("all children exist")
-            .children
-            .clone();
-
-        for child_id in current_children {
-            let child_action = graph.get(child_id).expect("all children exist").action;
-            if child_action.is_protected() {
-                protected_queue.push_back(child_id);
-            } else {
-                let protected =
-                    protect_large_branches_recursive(graph, child_id, 0, max, &mut large_branches);
-                if protected {
-                    protected_queue.push_back(child_id);
-                }
+    'branch: for branch_id in graph.branches.oids().collect::<Vec<_>>() {
+        let mut ancestors = graph.ancestors_of(branch_id).into_cursor();
+        let mut count = 0;
+        while let Some(ancestor_id) = ancestors.next(graph) {
+            count += 1;
+            if graph.branches.contains_oid(ancestor_id) {
+                // Let the parent branch take care of things
+                continue 'branch;
             }
+
+            let action = graph
+                .commit_get::<crate::graph::Action>(ancestor_id)
+                .copied()
+                .unwrap_or_default();
+            if action.is_protected() {
+                ancestors.stop();
+            }
+        }
+        if max <= count {
+            mark_branch_protected(graph, branch_id);
+            large_branches.extend(
+                graph
+                    .branches
+                    .get(branch_id)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|branch| branch.kind().has_user_commits().then(|| branch.name())),
+            );
         }
     }
 
     large_branches
 }
 
-fn protect_large_branches_recursive(
+fn mark_branch_protected(graph: &mut Graph, commit_id: git2::Oid) {
+    let protected_oids: Vec<_> = graph.ancestors_of(commit_id).collect();
+    for protected_oid in protected_oids {
+        graph.commit_set(protected_oid, crate::graph::Action::Protected);
+    }
+}
+
+pub fn tag_commits_while(
     graph: &mut Graph,
-    node_id: git2::Oid,
-    count: usize,
-    max: usize,
-    large_branches: &mut Vec<String>,
-) -> bool {
-    let mut needs_protection = false;
-
-    if !graph
-        .get(node_id)
-        .expect("all children exist")
-        .branches
-        .is_empty()
-    {
-    } else if count <= max {
-        let current_children = graph
-            .get(node_id)
-            .expect("all children exist")
-            .children
-            .clone();
-
-        for child_id in current_children {
-            needs_protection |=
-                protect_large_branches_recursive(graph, child_id, count + 1, max, large_branches);
-        }
-        if needs_protection {
-            let node = graph.get_mut(node_id).expect("all children exist");
-            node.action = crate::graph::Action::Protected;
-        }
-    } else {
-        mark_branch_protected(graph, node_id, large_branches);
-        needs_protection = true;
-    }
-
-    needs_protection
-}
-
-fn mark_branch_protected(graph: &mut Graph, node_id: git2::Oid, branches: &mut Vec<String>) {
-    let mut protected_queue = VecDeque::new();
-    protected_queue.push_back(node_id);
-    while let Some(current_id) = protected_queue.pop_front() {
-        let current = graph.get_mut(current_id).expect("all children exist");
-        current.action = crate::graph::Action::Protected;
-
-        if current.branches.is_empty() {
-            protected_queue.extend(&graph.get(current_id).expect("all children exist").children);
+    tag: impl Fn(&Graph, git2::Oid) -> Option<crate::any::BoxedEntry>,
+) {
+    let mut cursor = graph.descendants().into_cursor();
+    while let Some(descendant_id) = cursor.next(graph) {
+        if let Some(resource) = tag(graph, descendant_id) {
+            graph.commit_set(descendant_id, resource);
         } else {
-            branches.extend(
-                current
-                    .branches
-                    .iter()
-                    // Remote branches are implicitly protected, so we don't need to record them
-                    .filter_map(|b| b.local_name().map(String::from)),
-            );
+            cursor.stop();
         }
     }
 }
 
+pub fn trim_tagged_branch<R: Resource + Eq>(
+    graph: &mut Graph,
+    template: R,
+) -> Vec<crate::graph::Branch> {
+    let mut trimmed = Vec::new();
+
+    let mut branches = graph
+        .branches
+        .iter()
+        .map(|(id, _branches)| id)
+        .collect::<Vec<_>>();
+    let mut made_progress = true;
+    while made_progress {
+        made_progress = false;
+        branches.retain(|id| {
+            if graph.commit_get::<R>(*id) != Some(&template) {
+                // Not relevant, no more processing needed
+                return false;
+            }
+
+            if graph.children_of(*id).count() != 0 {
+                // Children might get removed in another pass
+                return true;
+            }
+
+            let mut to_remove = Vec::new();
+            let mut cursor = graph.ancestors_of(*id).into_cursor();
+            while let Some(candidate_id) = cursor.next(graph) {
+                if candidate_id == graph.root_id() {
+                    // Always must have at least one commit, don't remove
+                    cursor.stop();
+                } else if 1 < graph.children_of(*id).count() {
+                    // Shared commit, don't remove
+                    cursor.stop();
+                } else if graph
+                    .commit_get::<crate::graph::Action>(candidate_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .is_protected()
+                {
+                    // Protected commit, don't remove
+                    cursor.stop();
+                } else if candidate_id != *id && graph.branches.contains_oid(candidate_id) {
+                    // Hit another branch which needs its own evaluation for whether we should
+                    // remove it
+                    cursor.stop();
+                } else {
+                    trimmed.extend(graph.branches.remove(candidate_id).unwrap_or_default());
+                    to_remove.push(candidate_id);
+                }
+            }
+            for id in to_remove {
+                graph.remove(id);
+            }
+            made_progress = true;
+
+            false
+        });
+    }
+
+    trimmed
+}
+
+pub fn tag_stale_commits(
+    graph: &mut Graph,
+    repo: &dyn crate::git::Repo,
+    earlier_than: std::time::SystemTime,
+    ignore: &[git2::Oid],
+) {
+    tag_commits_while(graph, |_graph, id| {
+        if ignore.contains(&id) {
+            return None;
+        }
+        let commit = repo.find_commit(id)?;
+        (commit.time < earlier_than).then(|| StaleCommit.into())
+    })
+}
+
+pub fn trim_stale_branches(
+    graph: &mut Graph,
+    repo: &dyn crate::git::Repo,
+    earlier_than: std::time::SystemTime,
+    ignore: &[git2::Oid],
+) -> Vec<crate::graph::Branch> {
+    tag_stale_commits(graph, repo, earlier_than, ignore);
+    trim_tagged_branch(graph, StaleCommit)
+}
+
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaleCommit;
+
+impl crate::any::ResourceTag for StaleCommit {}
+
+pub fn tag_foreign_commits(
+    graph: &mut Graph,
+    repo: &dyn crate::git::Repo,
+    user: &str,
+    ignore: &[git2::Oid],
+) {
+    tag_commits_while(graph, |_graph, id| {
+        if ignore.contains(&id) {
+            return None;
+        }
+        let commit = repo.find_commit(id)?;
+        (commit.committer.as_deref() != Some(user) && commit.author.as_deref() != Some(user))
+            .then(|| ForeignCommit.into())
+    })
+}
+
+pub fn trim_foreign_branches(
+    graph: &mut Graph,
+    repo: &dyn crate::git::Repo,
+    user: &str,
+    ignore: &[git2::Oid],
+) -> Vec<crate::graph::Branch> {
+    tag_foreign_commits(graph, repo, user, ignore);
+    trim_tagged_branch(graph, ForeignCommit)
+}
+
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForeignCommit;
+
+impl crate::any::ResourceTag for ForeignCommit {}
+
+/*
 pub fn protect_old_branches(
     graph: &mut Graph,
     earlier_than: std::time::SystemTime,
@@ -156,47 +226,6 @@ pub fn protect_old_branches(
             } else {
                 if is_branch_old(graph, child_id, earlier_than, ignore) {
                     mark_branch_protected(graph, child_id, &mut old_branches);
-                }
-            }
-        }
-    }
-
-    old_branches
-}
-
-pub fn trim_old_branches(
-    graph: &mut Graph,
-    earlier_than: std::time::SystemTime,
-    ignore: &[git2::Oid],
-) -> Vec<String> {
-    let mut old_branches = Vec::new();
-
-    let mut protected_queue = VecDeque::new();
-    if graph.root().action.is_protected() {
-        protected_queue.push_back(graph.root_id());
-    }
-    while let Some(current_id) = protected_queue.pop_front() {
-        let current_children = graph
-            .get(current_id)
-            .expect("all children exist")
-            .children
-            .clone();
-
-        for child_id in current_children {
-            let child_action = graph.get(child_id).expect("all children exist").action;
-            if child_action.is_protected() {
-                protected_queue.push_back(child_id);
-            } else {
-                if is_branch_old(graph, child_id, earlier_than, ignore) {
-                    let removed = graph
-                        .remove_child(current_id, child_id)
-                        .expect("all children exist");
-                    old_branches.extend(removed.breadth_first_iter().flat_map(|n| {
-                        n.branches
-                            .iter()
-                            // Remote branches are implicitly protected, so we don't need to record them
-                            .filter_map(|b| b.local_name().map(String::from))
-                    }));
                 }
             }
         }
@@ -255,43 +284,6 @@ pub fn protect_foreign_branches(
             } else {
                 if !is_personal_branch(graph, child_id, user, ignore) {
                     mark_branch_protected(graph, child_id, &mut foreign_branches);
-                }
-            }
-        }
-    }
-
-    foreign_branches
-}
-
-pub fn trim_foreign_branches(graph: &mut Graph, user: &str, ignore: &[git2::Oid]) -> Vec<String> {
-    let mut foreign_branches = Vec::new();
-
-    let mut protected_queue = VecDeque::new();
-    if graph.root().action.is_protected() {
-        protected_queue.push_back(graph.root_id());
-    }
-    while let Some(current_id) = protected_queue.pop_front() {
-        let current_children = graph
-            .get(current_id)
-            .expect("all children exist")
-            .children
-            .clone();
-
-        for child_id in current_children {
-            let child_action = graph.get(child_id).expect("all children exist").action;
-            if child_action.is_protected() {
-                protected_queue.push_back(child_id);
-            } else {
-                if !is_personal_branch(graph, child_id, user, ignore) {
-                    let removed = graph
-                        .remove_child(current_id, child_id)
-                        .expect("all children exist");
-                    foreign_branches.extend(removed.breadth_first_iter().flat_map(|n| {
-                        n.branches
-                            .iter()
-                            // Remote branches are implicitly protected, so we don't need to record them
-                            .filter_map(|b| b.local_name().map(String::from))
-                    }));
                 }
             }
         }
@@ -392,8 +384,163 @@ pub fn rebase_pulled_branches(graph: &mut Graph, pull_start: git2::Oid, pull_end
         .branches
         .extend(end_branches);
 }
+*/
+
+pub fn mark_wip(graph: &mut Graph, repo: &dyn crate::git::Repo) {
+    let mut cursor = graph.descendants().into_cursor();
+    while let Some(current_id) = cursor.next(graph) {
+        if graph
+            .commit_get::<crate::graph::Action>(current_id)
+            .copied()
+            .unwrap_or_default()
+            .is_protected()
+        {
+            continue;
+        }
+
+        let commit = repo
+            .find_commit(current_id)
+            .expect("all commits in graph present in git");
+        if commit.wip_summary().is_some() {
+            graph.commit_set(current_id, Wip);
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Wip;
+
+impl crate::any::ResourceTag for Wip {}
+
+pub fn mark_fixup(graph: &mut Graph, repo: &dyn crate::git::Repo) {
+    let mut cursor = graph.descendants().into_cursor();
+    while let Some(current_id) = cursor.next(graph) {
+        if graph
+            .commit_get::<crate::graph::Action>(current_id)
+            .copied()
+            .unwrap_or_default()
+            .is_protected()
+        {
+            continue;
+        }
+
+        let commit = repo
+            .find_commit(current_id)
+            .expect("all commits in graph present in git");
+        if commit.fixup_summary().is_some() {
+            graph.commit_set(current_id, Fixup);
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Fixup;
+
+impl crate::any::ResourceTag for Fixup {}
 
 pub fn pushable(graph: &mut Graph) {
+    let branches = graph
+        .branches
+        .iter()
+        .map(|(id, _branches)| id)
+        .collect::<Vec<_>>();
+    for branch_id in branches {
+        mark_push_status(graph, branch_id);
+    }
+}
+
+fn mark_push_status(graph: &mut Graph, branch_id: git2::Oid) -> Option<PushStatus> {
+    if let Some(status) = graph.commit_get::<PushStatus>(branch_id) {
+        return Some(*status);
+    }
+
+    let mut status = Some(PushStatus::Pushable);
+
+    if graph
+        .commit_get::<crate::graph::Action>(branch_id)
+        .copied()
+        .unwrap_or_default()
+        .is_protected()
+    {
+        log::debug!(
+            "Branches at {} aren't pushable, the commit is protected",
+            branch_id
+        );
+        status = None;
+    } else {
+        let mut ancestors = graph.ancestors_of(branch_id).into_cursor();
+        while let Some(parent_id) = ancestors.next(graph) {
+            if graph
+                .commit_get::<crate::graph::Action>(parent_id)
+                .copied()
+                .unwrap_or_default()
+                .is_protected()
+            {
+                ancestors.stop();
+            } else if graph.commit_get::<Wip>(parent_id).is_some() {
+                log::debug!(
+                    "Branches at {} aren't pushable, commit {} is WIP",
+                    branch_id,
+                    parent_id,
+                );
+                status = Some(PushStatus::Blocked("wip"));
+                break;
+            } else if branch_id != parent_id && graph.branches.contains_oid(parent_id) {
+                let parent_status = mark_push_status(graph, parent_id);
+                match parent_status {
+                    Some(PushStatus::Blocked(reason)) => {
+                        log::debug!(
+                            "Branches at {} aren't pushable, parent commit {} is blocked for {}",
+                            branch_id,
+                            parent_id,
+                            reason
+                        );
+                        status = Some(PushStatus::Blocked("parent branch"));
+                        break;
+                    }
+                    Some(PushStatus::Pushed) | Some(PushStatus::Pushable) => {
+                        log::debug!("Branches at {} aren't pushable, parent branch at {} should be pushed first", branch_id, parent_id);
+                        status = Some(PushStatus::Blocked("parent branch"));
+                        break;
+                    }
+                    None => {
+                        // Must be a protected branch, safe for us to push
+                    }
+                }
+                ancestors.stop();
+            }
+        }
+    }
+
+    if graph
+        .branches
+        .get(branch_id)
+        .into_iter()
+        .flatten()
+        .any(|b| Some(b.id()) == b.push_id())
+    {
+        // User pushed, so trust them.  Consider all other branches as empty branches
+        log::debug!("A branch at {} is already pushed", branch_id);
+        status = Some(PushStatus::Pushed);
+    }
+
+    if let Some(status) = status {
+        graph.commit_set(branch_id, status);
+    }
+    status
+}
+/*
+    let mut cursor = graph.descendants().into_cursor();
+    while let Some(current_id) = cursor.next(graph) {
+        if graph
+            .commit_get::<crate::graph::Action>(current_id)
+            .copied()
+            .unwrap_or_default()
+            .is_protected()
+        {
+            continue;
+        }
+    }
     let mut node_queue: VecDeque<(git2::Oid, Option<&str>)> = VecDeque::new();
 
     // No idea if a parent commit invalidates our results
@@ -435,7 +582,24 @@ pub fn pushable(graph: &mut Graph) {
         node_queue.extend(current.children.iter().copied().map(|id| (id, cause)));
     }
 }
+*/
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PushStatus {
+    Blocked(&'static str),
+    Pushed,
+    Pushable,
+}
+
+impl Default for PushStatus {
+    fn default() -> Self {
+        Self::Blocked("protected")
+    }
+}
+
+impl crate::any::ResourceTag for PushStatus {}
+
+/*
 /// Quick pass for what is droppable
 ///
 /// We get into this state when a branch is squashed.  The id would be different due to metadata
@@ -1092,3 +1256,4 @@ fn extend_dependents(
         script.dependents.extend(dependents);
     }
 }
+*/

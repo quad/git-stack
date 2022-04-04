@@ -23,3 +23,11 @@ impl Action {
         matches!(self, Action::Delete)
     }
 }
+
+impl Default for Action {
+    fn default() -> Self {
+        Self::Pick
+    }
+}
+
+impl crate::any::ResourceTag for Action {}

@@ -49,6 +49,8 @@ itertools = "0.10"
 ignore = "0.4"
 bstr = "0.2"
 maplit = "1"
+petgraph = "0.6.0"
+downcast-rs = "1.2.0"
 
 [dev-dependencies]
 git-fixture = { version = "0.2" }

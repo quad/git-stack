@@ -59,28 +59,21 @@ pub fn protected(args: &crate::args::Args) -> proc_exit::ExitResult {
     .with_code(proc_exit::Code::CONFIG_ERR)?;
 
     let repo = git_stack::git::GitRepo::new(repo);
-    let mut branches = git_stack::git::Branches::new([]);
-    let mut protected_branches = git_stack::git::Branches::new([]);
-    for branch in repo.local_branches() {
-        if protected.is_protected(&branch.name) {
-            log::trace!("Branch {} is protected", branch);
-            protected_branches.insert(branch.clone());
-            if let Some(remote) = repo.find_remote_branch(repo.pull_remote(), &branch.name) {
-                protected_branches.insert(remote.clone());
-                branches.insert(remote);
-            }
-        }
-        branches.insert(branch);
-    }
+    let branches = git_stack::graph::BranchSet::from_repo(&repo, &protected)
+        .with_code(proc_exit::Code::FAILURE)?;
 
-    for (branch_id, branches) in branches.iter() {
-        if protected_branches.contains_oid(branch_id) {
-            for branch in branches {
-                writeln!(std::io::stdout(), "{}", branch)?;
-            }
-        } else {
-            for branch in branches {
-                log::debug!("Unprotected: {}", branch);
+    for (_, branches) in branches.iter() {
+        for branch in branches {
+            match branch.kind() {
+                git_stack::graph::BranchKind::Deleted
+                | git_stack::graph::BranchKind::Mutable
+                | git_stack::graph::BranchKind::Mixed => {
+                    log::debug!("{:?}: {}", branch.kind(), branch.display_name());
+                }
+                git_stack::graph::BranchKind::Protected => {
+                    log::debug!("{:?}: {}", branch.kind(), branch.display_name());
+                    writeln!(std::io::stdout(), "{}", branch.display_name())?;
+                }
             }
         }
     }
