@@ -145,6 +145,10 @@ Cons:
 - Working with multiple remotes requires many manual steps to manage
   branches
 
+## Super Pull Requests (spr)
+
+[Website](https://getcord.github.io/spr/)
+
 ## Stacked Git
 
 [Website](https://stacked-git.github.io/)
