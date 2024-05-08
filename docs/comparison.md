@@ -174,6 +174,10 @@ Cons:
 
 [Website](https://github.com/gitext-rs/git-stack)
 
+## `git-stacked-rebase`
+
+[Website](https://github.com/kiprasmel/git-stacked-rebase)
+
 ## `git-chain`
 
 [Website](https://github.com/Shopify/git-chain)
