@@ -170,6 +170,10 @@ Cons:
 
 [Website](https://github.com/git-series/git-series)
 
+## `gittext-rs/git-stack`
+
+[Website](https://github.com/gitext-rs/git-stack)
+
 ## `git-chain`
 
 [Website](https://github.com/Shopify/git-chain)
