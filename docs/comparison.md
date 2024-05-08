@@ -145,6 +145,10 @@ Cons:
 - Working with multiple remotes requires many manual steps to manage
   branches
 
+## Revup
+
+[Website](https://github.com/Skydio/revup)
+
 ## Super Pull Requests (spr)
 
 [Website](https://getcord.github.io/spr/)
